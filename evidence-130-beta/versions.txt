@@ -1,0 +1,12 @@
+kind: kind version 0.31.0
+Client Version: v1.35.2
+Kustomize Version: v5.7.1
+
+istio components:
+  istio-cni-node-k6htz: registry.istio.io/release/install-cni:1.30.0-beta.0-distroless
+  istiod-696fcf5fbf-dr4vq: registry.istio.io/release/pilot:1.30.0-beta.0-distroless
+  ztunnel-zl4qb: registry.istio.io/release/ztunnel:1.30.0-beta.0-distroless
+gateway pod image:
+  registry.istio.io/release/proxyv2:1.30.0-beta.0-distroless
+jellyfin image (resolved digest):
+  docker.io/jellyfin/jellyfin@sha256:1694ff069f0c9dafb283c36765175606866769f5d72f2ed56b6a0f1be922fc37

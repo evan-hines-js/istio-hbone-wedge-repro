@@ -1,108 +1,119 @@
-# Istio ambient HBONE upstream pool wedge — minimal reproducer
+# Istio ambient gateway wedge during sustained video playback — minimal reproducer
 
 ## TL;DR
 
-On Istio 1.29.2 in **ambient** mode, the gateway envoy's HBONE upstream HTTP/2 codec emits `RST_STREAM(INTERNAL_ERROR)` on long, large responses (e.g. an MP4 served via HTTP `Range` requests during browser video playback). The accounting path for this codec-emitted reset is broken: streams terminate without incrementing `rq_success`, `rq_error`, or `rq_timeout` and without decrementing `rq_active`. They leak silently from the cluster pool. End-user effect: requests hang forever, video playback stalls.
+On Istio 1.29.2 and 1.30.0-beta.0 in **ambient** mode, browser video playback through an Istio gateway wedges after a burst of mid-stream `Range` aborts (a few dozen player seeks over a short period): the browser stalls indefinitely, and the gateway envoy's upstream-cluster counters for the backend service show `rq_total` continuing to climb while `rq_success` freezes, with `rq_error` and `rq_timeout` staying at 0. ztunnel on the destination node also logs `stream error received: unexpected internal error encountered` on long-lived inbound transfers during the same session. Restarting the gateway pod clears the wedge until the next aggressive-seek session.
 
 ## Confirmed reproducer environment
 
-This repository reproduces the bug on a **fresh single-node kind cluster** with default kindnet CNI, default Istio ambient profile, default Gateway API standard channel, no custom policies, no waypoints, no co-tenant services, no env-var overrides. Pure stock components.
+This repository reproduces the wedge on a **fresh single-node kind cluster** with default kindnet CNI, default Istio ambient profile, default Gateway API standard channel, no custom policies, no waypoints, no co-tenant services, no env-var overrides. Pure stock components.
 
-**Control test (run on the same cluster) confirms the bug is in the gateway path.** Running `kubectl port-forward -n media svc/jellyfin 8096:8096` and pointing the browser at `http://localhost:8096/web/` — same kind cluster, same jellyfin pod, same media file, same browser, same aggressive seeking — plays cleanly with no stalls and no leak. The path becomes `browser → kubectl port-forward → ztunnel L4 inbound → jellyfin pod`, with **no gateway envoy and no HBONE upstream pool**. The bug only appears when traffic flows through the gateway envoy.
+**Control test 1 — `kubectl port-forward` (gateway bypassed).** Running `kubectl port-forward -n media svc/jellyfin 8096:8096` and pointing the browser at `http://localhost:8096/web/` — same kind cluster, same jellyfin pod, same media file, same browser, same aggressive seeking — plays cleanly without stalls and the gateway envoy's upstream-cluster counters do not move. The two paths differ only in whether traffic transits the gateway envoy.
 
-## What the bug looks like
+**Control test 2 — LoadBalancer Service (gateway not used).** On a separate cluster, exposing jellyfin via a `Service.type=LoadBalancer` (e.g. Cilium LB-IPAM) and reaching the pod through that VIP plays cleanly under the same playback pattern. The wedge does not appear.
 
-### 1. Gateway envoy upstream-cluster stats freeze (the leak)
+## What you observe
+
+### 1. Gateway envoy upstream-cluster counters
 
 Polling `/clusters` for `outbound|8096||jellyfin.media.svc.cluster.local` during ~90 seconds of browser playback:
 
 ```
-leak = rq_total - rq_success - rq_active   (>0 = requests vanished from accounting)
+gap = rq_total - rq_success - rq_active   (>0 = requests not in success or active)
 
-time     | cx_act cx_tot | rq_act rq_tot rq_succ | leak
+time     | cx_act cx_tot | rq_act rq_tot rq_succ | gap
 ---------+---------------+------------------------+-----
 02:19:50 |    5    13   |    2    216    212    |  2
 02:20:09 |    7    22   |    7    233    221    |  5    ← rq_success freezes at 221
-02:20:21 |    7    22   |    7    233    221    |  5    (6s, zero progress: 7 streams stuck)
-02:20:33 |   12    28   |   12    239    221    |  6    (more requests arrive, all stick)
+02:20:21 |    7    22   |    7    233    221    |  5    (6s with no movement)
+02:20:33 |   12    28   |   12    239    221    |  6
 02:20:46 |   13    29   |   13    240    221    |  6
 ```
 
-`rq_success` froze at 221 from 02:20:09 onward — 60+ seconds with zero successful upstream completions despite 24 more requests arriving. `rq_error` and `rq_timeout` stayed at 0 throughout (envoy never classified the wedged streams as failed). `rq_active` climbed and stayed pinned (streams stuck in flight). `cx_active` climbed because envoy opened new connections trying to make progress; the bad ones never close.
+`rq_success` stays at 221 from 02:20:09 onward — 60+ seconds while 24 more requests arrive. `rq_error` and `rq_timeout` stay at 0. `rq_active` climbs and stays pinned. `cx_active` climbs alongside `cx_total`.
 
-Captured live during a wedged session: [`evidence/gateway-clusters-jellyfin.txt`](evidence/gateway-clusters-jellyfin.txt) (envoy `/clusters` dump for the upstream cluster, with the freeze visible). A reference timestamped poll trace from a longer passive-playback wedge: [`evidence/leak-fingerprint.txt`](evidence/leak-fingerprint.txt).
+Captured live during a wedged session: [`evidence/gateway-clusters-jellyfin.txt`](evidence/gateway-clusters-jellyfin.txt) (envoy `/clusters` dump for the upstream cluster). A reference timestamped poll trace: [`evidence/leak-fingerprint.txt`](evidence/leak-fingerprint.txt).
 
 ### 2. Termination flags during the wedge
 
-The committed evidence is from a seek-driven wedge run. Per-flag breakdown of every request the gateway envoy saw, captured live: [`evidence/gateway-requests-by-flag.txt`](evidence/gateway-requests-by-flag.txt):
+Per-flag breakdown of every request the gateway envoy saw during a seek-driven wedge run: [`evidence/gateway-requests-by-flag.txt`](evidence/gateway-requests-by-flag.txt):
 
 ```
-code=0   flags=DC count=9      ← envoy never produced any response, client gave up
-code=200 flags=DC count=1
-code=206 flags=DC count=4      ← Range-request body cut off mid-stream
-code=503 flags=UH count=1
+code=0   flags=DC count=13
+code=101 flags=DC count=1
 code=101 flags=UC count=1
-code=200 flags=- count=93      (clean responses)
-code=204 flags=- count=12
-code=206 flags=- count=3
-code=304 flags=- count=37
+code=503 flags=UH count=1
+code=200 flags=-  count=340
+code=204 flags=-  count=83
+code=206 flags=-  count=142
+code=206 flags=DC count=6
+code=304 flags=-  count=6
 ```
 
-`DC` = `downstream_remote_disconnect`; `UH` = `no_healthy_upstream`; `UC` = `upstream_connection_termination`. These 15 non-clean terminations correspond exactly to the gap between `rq_total` and `rq_success` in the cluster stats.
+`DC` = `downstream_remote_disconnect`; `UH` = `no_healthy_upstream`; `UC` = `upstream_connection_termination`.
 
-Concrete sample lines from the gateway access log — note the 39.8 MB transfer cut off mid-stream when the browser seeked:
+Sample lines from the gateway access log:
 
 ```
 [02:37:30.332Z] "GET /Videos/.../stream.mp4?Static=true&..." 206 DC downstream_remote_disconnect
                 bytes_sent=39796736 duration=398ms
 [02:37:34.638Z] "GET /Videos/.../stream.mp4?Static=true&..." 0 DC downstream_remote_disconnect
-                bytes_sent=0  duration=12890ms       ← envoy held the request for 12s
-                                                        and never returned bytes
+                bytes_sent=0  duration=12890ms
 ```
 
 Full access log: [`evidence/gateway-access-log.log`](evidence/gateway-access-log.log).
 
-### 2b. Alternative trigger: passive linear playback → `RST_STREAM(INTERNAL_ERROR)`
+### 2b. ztunnel `stream error received` on long-lived inbound transfers
 
-In separate runs without seeking (just letting the video play normally), the gateway envoy's HBONE upstream HTTP/2 codec emits `RST_STREAM(INTERNAL_ERROR)` mid-response on long transfers. ztunnel on the destination node logs the resulting `stream error received: unexpected internal error encountered` (the wording `received` is dispositive — ztunnel received the RST, so envoy sent it).
+During the same seek-driven session, ztunnel on the destination node also logs lines of the form on inbound flows that ran for tens of seconds before the abort:
 
-This produces the **same upstream-cluster-counter signature** as the seek-driven path: `rq_success` freezes, `rq_active` stays pinned, `rq_error = rq_timeout = 0`. Same accounting bug, different trigger pattern.
+```
+... error access connection complete  ... direction="inbound" ... bytes_sent=64223639
+    duration="30217ms" error="send: io error: stream error received: unexpected internal error encountered"
+```
 
-Reference trace from a passive-playback session showing the cluster-stats freeze: [`evidence/leak-fingerprint.txt`](evidence/leak-fingerprint.txt). The `RST_STREAM` lines themselves can be reproduced in `evidence/ztunnel.log` by re-running the repro and letting the video play passively for ~60–90 s instead of seeking.
+Reference trace: [`evidence/leak-fingerprint.txt`](evidence/leak-fingerprint.txt).
 
 ### 3. Browser-visible symptom
 
-Video playback in the browser stalls within ~30–90 seconds of pressing Play. Restarting the gateway pod (`kubectl rollout restart deploy/ingress-istio -n media`) clears the wedge — until the next sustained playback session, at which point it returns.
+Once enough seeks have accumulated, video playback in the browser stalls (spinner indefinitely). Restarting the gateway pod (`kubectl rollout restart deploy/ingress-istio -n media`) clears the wedge — until the next aggressive-seek session, at which point it returns.
 
 ### 4. URL pattern that triggers it
 
 Browser playing the bundled MP4 (Big Buck Bunny, h264 baseline + AAC, browser-compatible) direct-plays via HTTP `Range` requests on `/Videos/{itemId}/stream.mp4`:
 
 ```
-GET /Videos/7d7ee.../stream.mp4?api_key=...&static=true HTTP/1.1
+GET /Videos/7d7ee.../stream.mp4?Static=true&ApiKey=... HTTP/1.1
 Range: bytes=0-1048575
 → 206 Partial Content
 ```
 
-This is **not HLS** — for an h264 source, jellyfin direct-plays. The trigger is large `Range`-served byte ranges over HTTP/2 streams from the browser, each multiplexed by envoy onto the HBONE upstream's CONNECT pool. Sample lines: see [`evidence/gateway-access-log.log`](evidence/gateway-access-log.log) (grep for `/Videos/.*stream.mp4`).
+This is **not HLS** — for an h264 source, jellyfin direct-plays. The traffic pattern is large `Range`-served byte ranges over HTTP/2 streams from the browser. Sample lines: see [`evidence/gateway-access-log.log`](evidence/gateway-access-log.log) (grep for `/Videos/.*stream.mp4`).
 
-The fastest reproducer is **aggressive seeking** in the browser player (jump ~2 minutes forward, then back, repeat). Each seek aborts the in-flight `Range` request mid-response and starts a new one. That mid-response stream-abort churn provokes the codec-emitted `RST_STREAM(INTERNAL_ERROR)` reliably within ~10 seconds. Passive linear playback also reproduces the wedge but takes 60–90 seconds.
+The wedge requires **aggressive seeking** in the browser player (jump ~2 minutes forward, then back, repeat). Each seek aborts the in-flight `Range` request mid-response and starts a new one. A few dozen such aborts over a short period reliably wedges the gateway. Passive linear playback may wedge more slowly in some runs but is not reliable; multi-minute passive runs in this reproducer have left counters healthy.
 
-A burst of `curl` requests against `/` (returns a 5 KB redirect) does **not** trigger the bug. The wedge requires the large-response + mid-stream-abort pattern.
+A burst of `curl` requests against `/` (returns a 5 KB redirect) does **not** reproduce the wedge either — the reproducer needs the large-response traffic pattern *plus* mid-stream aborts.
 
-## What we ruled out
+## Also reproduces on Istio `1.30.0-beta.0`
 
-The reproducer is built specifically to eliminate environment-specific causes. The bug **does not require**:
+Re-running the same reproducer with `ISTIO_VERSION=1.30.0-beta.0` (released 2026-04-27, all components from `registry.istio.io/release/`) produces the same counter signature within seconds of seek-driven playback:
 
-- **Cilium** — kind uses kindnet + kube-proxy
-- **Multi-node clusters** — kind here is single-node
-- **Waypoints** — none configured
-- **Co-tenant services** sharing the gateway — only jellyfin
-- **`PILOT_ENABLE_ALPHA_GATEWAY_API`** — left at default (false)
-- **Custom AuthorizationPolicies / PeerAuthentication** — none
-- **Custom trust domain** — using default `cluster.local`
-- **TCPRoute / experimental Gateway API CRDs** — only stable `HTTPRoute` is installed
-- **Any non-default Istio profile** — using `--set profile=ambient` defaults
+```
+rq_total = 379, rq_success = 353, rq_active = 6        → gap of 20
+rq_error = 0,   rq_timeout = 0
+ztunnel "stream error received…":  7 entries
+gateway access-log "0 DC" / "206 DC":  32 entries
+```
+
+A single 1.30.0-beta.0 run captured both patterns concurrently — `stream error received` lines on long-lived inbound transfers (one with `bytes_sent=64223639` over `30217ms`) and `0 DC` / `206 DC` lines from seek-aborted Range requests.
+
+Captured evidence: [`evidence-130-beta/`](evidence-130-beta/).
+
+To reproduce against 1.30.0-beta.0 yourself:
+
+```bash
+ISTIO_VERSION=1.30.0-beta.0 ./repro.sh
+```
 
 ## Versions (pinned exactly)
 
@@ -123,7 +134,7 @@ The reproducer is built specifically to eliminate environment-specific causes. T
 
 ## Prerequisites
 
-- Linux host with Docker
+- Linux or macOS host with Docker (kind on Docker Desktop works on macOS arm64/amd64)
 - `kind` v0.31.0 or compatible
 - `kubectl`
 - `curl`
@@ -148,7 +159,7 @@ This is fully self-contained:
 - Stages Big Buck Bunny in the kind node at `/opt/media/bbb.mp4`
 - Deploys jellyfin pinned to the digest above, with `/media` hostPath and `/config` emptyDir
 - Creates the `Gateway` (`gatewayClassName: istio`) and `HTTPRoute`
-- Patches the gateway Service to NodePort 30080
+- Creates a separate NodePort Service (`ingress-nodeport`) selecting the gateway pod on host port 30080 — kept distinct from the gateway-controller-managed Service so the controller doesn't reconcile it away
 
 Takes 4–8 minutes depending on image-pull speed.
 
@@ -162,9 +173,9 @@ Open `http://localhost:30080/web/`. Walk through the wizard:
 - Sign in with the admin user you just created.
 - Wait ~10 s for the library scan; **Big Buck Bunny** will appear on the home screen.
 - Click it, click **Play**.
-- **Fast trigger: seek around aggressively.** Click ahead ~2 minutes on the seekbar, then back ~2 minutes, repeat. Each seek aborts the in-flight `Range` request and starts a new one — that churn drives the wedge in **~10 seconds** vs. ~60–90 s of passive playback. The seek-induced mid-response stream aborts are the most efficient way to provoke the codec-emitted `RST_STREAM`.
+- **Seek aggressively.** Click ahead ~2 minutes on the seekbar, then back ~2 minutes, repeat. Each seek aborts the in-flight `Range` request and starts a new one. A few dozen seeks over a short period reliably wedges the gateway. Passive playback may wedge more slowly in some runs but is not reliable.
 
-### 3. Watch the leak accumulate
+### 3. Watch the counters
 
 In a second terminal:
 
@@ -172,7 +183,7 @@ In a second terminal:
 ./watch-stats.sh
 ```
 
-Within ~10 seconds of seek-driven playback (or ~60–90 s of passive playback) you will see `rq_success` freeze on the `outbound|8096||jellyfin.media.svc.cluster.local` cluster while `rq_total` keeps climbing, with `rq_error = rq_timeout = 0`. The "leak" column will grow.
+After a few dozen seeks over a short period, you will see `rq_success` freeze on the `outbound|8096||jellyfin.media.svc.cluster.local` cluster while `rq_total` keeps climbing, with `rq_error = rq_timeout = 0`. The "gap" column will grow.
 
 In the browser: video playback will stall (spinner indefinitely).
 
@@ -184,10 +195,10 @@ In the browser: video playback will stall (spinner indefinitely).
 
 Writes the following to `./evidence/`:
 
-- `ztunnel-rst-stream.log` — every line where ztunnel logs `stream error received: unexpected internal error encountered`. Each line is one stream the gateway envoy reset mid-response. `bytes_sent` and `duration` show how far the transfer got.
-- `gateway-access-log.log` — gateway envoy access log entries during the wedge. Look for response code `0` with flag `DC` (`0 DC downstream_remote_disconnect`) — these are the wedged requests as seen from the downstream side: envoy never produced a response, the client (browser) gave up and closed.
-- `gateway-clusters-jellyfin.txt` — `/clusters` dump for the `outbound|8096||jellyfin.media.svc.cluster.local` cluster, captured live during the leak so the counters show the freeze.
-- `gateway-stats-jellyfin.txt` — `/stats` for the same cluster + `connect_originate` (the HBONE shared pool) + `inner_connect_originate`. All `rq_*`, `cx_*`, `http2.*` counters.
+- `ztunnel.log` — ztunnel log lines matching `stream error|RST_STREAM|INTERNAL_ERROR|error|access`. Look for `stream error received: unexpected internal error encountered` on long-lived inbound transfers (only appears if at least one Range fetch ran for tens of seconds before its abort).
+- `gateway-access-log.log` — gateway envoy access log entries during the wedge. Look for response code `0` with flag `DC` (`0 DC downstream_remote_disconnect`) — entries with `bytes_sent=0` and a long `duration` showing the downstream side closed.
+- `gateway-clusters-jellyfin.txt` — `/clusters` dump for the `outbound|8096||jellyfin.media.svc.cluster.local` cluster, captured live during a wedged session so the counters show the freeze.
+- `gateway-requests-by-flag.txt` — `istio_requests_total` tally as `code=N flags=X count=Y` rows; the count of rows with non-`-` flags matches the gap in the cluster counters.
 - `gateway-cluster-configs.json` — full envoy cluster config for `connect_originate`, `inner_connect_originate`, and the jellyfin upstream. Useful for inspecting HTTP/2 settings, idle timeouts, circuit-breaker thresholds.
 - `versions.txt` — resolved versions of every component for traceability.
 
@@ -198,9 +209,9 @@ kubectl --kubeconfig ~/.cache/istio-hbone-wedge-repro/kubeconfig \
   rollout restart deploy/ingress-istio -n media
 ```
 
-### 5. Control test — confirm the bug is in the gateway envoy, not jellyfin
+### 5. Control tests — same playback, gateway not used
 
-Bypass the gateway entirely with `kubectl port-forward` and point the browser at the pod directly:
+**(a) `kubectl port-forward`.** Bypass the gateway and point the browser at the pod directly:
 
 ```bash
 # replace <homelab-host> with wherever the kind cluster is running.
@@ -210,24 +221,24 @@ ssh -L 8096:localhost:8096 <homelab-host> \
    kubectl port-forward -n media svc/jellyfin 8096:8096"
 ```
 
-Then point the browser at `http://localhost:8096/web/`, run the wizard again (different origin, jellyfin treats it as a separate setup; same `/media` library), play the same video, seek aggressively the same way. **Plays cleanly. No stalls. No `rq_success` freeze. No `0 DC` access logs. No leak.**
+Then point the browser at `http://localhost:8096/web/`, run the wizard again (different origin, jellyfin treats it as a separate setup; same `/media` library), play the same video, seek aggressively the same way. Playback is smooth, the gateway envoy's upstream-cluster counters do not move, and no `0 DC` lines appear in the gateway access log.
 
 Path comparison:
 
 ```
-WEDGES (via gateway):
+Wedges (via gateway):
   browser → kind 30080 → ingress-istio gateway pod (envoy)
-                       → HBONE upstream pool (HTTP/2 CONNECT to ztunnel:15008)
+                       → HTTP/2 CONNECT to ztunnel:15008
                        → ztunnel inbound on jellyfin's node
                        → jellyfin pod
 
-DOES NOT WEDGE (via port-forward):
+Does not wedge (via port-forward):
   browser → kubectl port-forward
           → ztunnel L4 inbound on jellyfin's node
           → jellyfin pod
 ```
 
-The only difference is the gateway envoy and its HBONE upstream pool. Same jellyfin, same media file, same client, same browser, same seeking pattern. **The bug is in the gateway envoy's HBONE upstream path.**
+**(b) LoadBalancer Service.** On a separate cluster (not bundled into this `repro.sh` because kind has no LoadBalancer implementation by default), reaching jellyfin via a `Service.type=LoadBalancer` (e.g. Cilium LB-IPAM) plays cleanly under the same playback pattern. The wedge does not appear.
 
 ## Cleanup
 
@@ -247,23 +258,12 @@ gather-evidence.sh                 captures logs / stats / configs to ./evidence
                                    (run while the gateway is wedged)
 cleanup.sh                         tear down + clean cache
 evidence/                          populated by gather-evidence.sh
-  ztunnel-rst-stream.log           RST_STREAM(INTERNAL_ERROR) lines from ztunnel
+  ztunnel.log                      filtered ztunnel log (look for `stream error received`)
   gateway-access-log.log           gateway envoy access log (look for 0 DC)
-  gateway-clusters-jellyfin.txt    /clusters dump showing the leak
-  gateway-stats-jellyfin.txt       /stats counters for jellyfin + connect_originate
+  gateway-clusters-jellyfin.txt    /clusters dump from a wedged session
+  gateway-requests-by-flag.txt     istio_requests_total tally by code × flags
   gateway-cluster-configs.json     envoy cluster configs (HTTP/2 settings)
   versions.txt                     resolved versions of every component
   leak-fingerprint.txt             reference timestamped poll trace from prior run
+evidence-130-beta/                 same artifacts captured against Istio 1.30.0-beta.0
 ```
-
-## Filing this with Istio
-
-The class of bug is twofold:
-
-1. **The codec emits the reset.** Whatever frame sequence the gateway's HBONE upstream HTTP/2 codec encounters during a long, large response causes it to emit `RST_STREAM(INTERNAL_ERROR)`. Likely a flow-control or stream-state edge case on CONNECT-wrapped streams. Root cause unknown without source-level investigation.
-
-2. **The accounting path leaks.** The upstream cluster's accounting for self-initiated `RST_STREAM(INTERNAL_ERROR)` does not increment `rq_success`, `rq_error`, or `rq_timeout` and does not decrement `rq_active`. The slot leaks until the downstream client disconnects (which appears as `0 DC downstream_remote_disconnect` in the gateway access log but never makes it into upstream cluster stats).
-
-(2) is fixable independently of (1) and would at least make this debuggable in the field — pool exhaustion under sustained playback would surface as `rq_error` instead of vanishing into thin air. That's a near-term win for any fleet running Istio ambient even before (1) is understood.
-# istio-hbone-wedge-repro
-# istio-hbone-wedge-repro

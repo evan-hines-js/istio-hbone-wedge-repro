@@ -136,14 +136,14 @@
     "metadata": {
       "filter_metadata": {
         "istio": {
+          "disable_mx": true,
           "services": [
             {
+              "host": "jellyfin.media.svc.cluster.local",
               "namespace": "media",
-              "name": "jellyfin",
-              "host": "jellyfin.media.svc.cluster.local"
+              "name": "jellyfin"
             }
-          ],
-          "disable_mx": true
+          ]
         }
       }
     },

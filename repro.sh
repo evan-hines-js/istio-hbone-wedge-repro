@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Minimal reproducer for the Istio ambient HBONE upstream pool wedge.
+# Minimal reproducer for an Istio ambient gateway wedge during sustained video playback.
 #
 # Brings up a single-node kind cluster (default kindnet CNI), installs Istio
 # 1.29.2 in ambient mode (default profile, no env-var overrides), installs
@@ -37,9 +37,16 @@ for t in kind kubectl docker curl; do
 done
 
 step "2) download istioctl ${ISTIO_VERSION} (cached)"
+case "$(uname -s)/$(uname -m)" in
+  Linux/x86_64)  ISTIOCTL_ARCH="linux-amd64"  ;;
+  Linux/aarch64) ISTIOCTL_ARCH="linux-arm64"  ;;
+  Darwin/arm64)  ISTIOCTL_ARCH="osx-arm64"    ;;
+  Darwin/x86_64) ISTIOCTL_ARCH="osx-amd64"    ;;
+  *) echo "unsupported host: $(uname -s)/$(uname -m)"; exit 1 ;;
+esac
 if [ ! -x "${ISTIOCTL}" ]; then
   mkdir -p "${WORK_DIR}/istio-${ISTIO_VERSION}/bin"
-  curl -sSL "https://github.com/istio/istio/releases/download/${ISTIO_VERSION}/istioctl-${ISTIO_VERSION}-linux-amd64.tar.gz" \
+  curl -sSL "https://github.com/istio/istio/releases/download/${ISTIO_VERSION}/istioctl-${ISTIO_VERSION}-${ISTIOCTL_ARCH}.tar.gz" \
     | tar -xz -C "${WORK_DIR}/istio-${ISTIO_VERSION}/bin"
 fi
 "${ISTIOCTL}" version --remote=false
@@ -146,7 +153,7 @@ spec:
   - backendRefs: [{ name: jellyfin, port: 8096 }]
 EOF
 
-step "12) sidecar NodePort Service (avoids istio-controller reconciling our patch)"
+step "12) separate NodePort Service selecting the gateway pod (avoids istio-controller reconciling its managed Service)"
 kubectl apply -n media -f - <<'EOF'
 apiVersion: v1
 kind: Service
@@ -180,7 +187,7 @@ echo "jellyfin response code via gateway: $code"
 cat <<'EOF'
 
 ==============================================================================
-KIND CLUSTER UP. Now drive the bug manually:
+KIND CLUSTER UP. Now drive the wedge manually:
 
   1. Open http://localhost:30080/web/ in a browser.
      - Walk through the setup wizard. Pick any admin user/password.
@@ -191,13 +198,14 @@ KIND CLUSTER UP. Now drive the bug manually:
      - Wait ~10 s for the library scan; "Big Buck Bunny" appears on the home.
      - Click it, click Play.
      - FAST TRIGGER: seek aggressively (jump 2 min ahead, 2 min back, repeat).
-       Wedges in ~10 s. Passive linear playback also wedges in ~60–90 s.
+       Aggressive seeking is the reliable trigger; passive linear playback
+       may wedge more slowly in some runs but is not reliable.
 
   2. In another terminal, start the stats watcher:
 
        ./watch-stats.sh
 
-  3. Within ~10 s of seek-driven playback you will see the leak:
+  3. Within ~10 s of seek-driven playback you will see:
      - rq_success on the jellyfin upstream cluster freezes
      - rq_active climbs and stays pinned
      - rq_error and rq_timeout stay at zero
@@ -208,7 +216,7 @@ KIND CLUSTER UP. Now drive the bug manually:
 
        ./gather-evidence.sh
 
-  6. (Optional control test — proves the bug is in the gateway, not jellyfin)
+  6. (Optional control test — same playback with the gateway bypassed)
      Bypass the gateway entirely from your laptop:
 
        ssh -L 8096:localhost:8096 <homelab-host> \
@@ -216,6 +224,7 @@ KIND CLUSTER UP. Now drive the bug manually:
           kubectl port-forward -n media svc/jellyfin 8096:8096"
 
      Then in browser: http://localhost:8096/web/ — wizard again, /media library
-     again, play and seek the same video. Plays cleanly. No stalls. No leak.
+     again, play and seek the same video. Plays cleanly. No stalls. Gateway
+     upstream-cluster counters do not move.
 ==============================================================================
 EOF

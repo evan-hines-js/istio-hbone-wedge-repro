@@ -1,10 +1,11 @@
 kind:    kind version 0.31.0
-kubectl client: Client Version: v1.35.2
+Client Version: v1.32.2
+Kustomize Version: v5.5.0
 
 istio components:
-  istio-cni-node-855n6: docker.io/istio/install-cni:1.29.2-distroless
-  istiod-7fcd679676-n9rjd: docker.io/istio/pilot:1.29.2-distroless
-  ztunnel-28jps: docker.io/istio/ztunnel:1.29.2-distroless
+  istio-cni-node-6h8xn: docker.io/istio/install-cni:1.29.2-distroless
+  istiod-7fcd679676-6zmm7: docker.io/istio/pilot:1.29.2-distroless
+  ztunnel-phmbx: docker.io/istio/ztunnel:1.29.2-distroless
 
 gateway pod image:
   docker.io/istio/proxyv2:1.29.2-distroless

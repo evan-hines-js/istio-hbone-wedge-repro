@@ -1,0 +1,8 @@
+code=0 flags=DC count=20
+code=101 flags=UC count=1
+code=200 flags=- count=301
+code=204 flags=- count=24
+code=206 flags=- count=13
+code=206 flags=DC count=12
+code=304 flags=- count=2
+code=503 flags=UH count=1

@@ -3,9 +3,9 @@
 #
 # Run this WHILE THE GATEWAY IS WEDGED — i.e. immediately after watch-stats.sh
 # shows rq_success frozen and rq_active pinned, BEFORE restarting the gateway
-# pod. Once the gateway restarts, leaked stream slots are gone and the live
-# evidence is lost. (ztunnel logs persist across the gateway pod lifecycle,
-# but envoy stats and access logs reset.)
+# pod. Once the gateway restarts, the live evidence is lost. (ztunnel logs
+# persist across the gateway pod lifecycle, but envoy stats and access logs
+# reset.)
 
 set -euo pipefail
 
@@ -40,12 +40,13 @@ echo "    RST_STREAM(INTERNAL_ERROR) count: ${RST_COUNT}"
 echo "==> 2/6 gateway envoy access log (look for 0 DC = downstream disconnected on stuck request)"
 kubectl logs -n media "$GW" -c istio-proxy --tail=5000 2>/dev/null \
   | grep -E "^\[" \
+  | sed -E 's/(ApiKey=)[^&" ]+/\1REDACTED/g; s/(api_key=)[^&" ]+/\1REDACTED/g; s/(deviceId=)[^&" ]+/\1REDACTED/g; s/(UserId=)[^&" ]+/\1REDACTED/g; s/(mediaSourceId=)[^&" ]+/\1REDACTED/g; s/(Tag=)[^&" ]+/\1REDACTED/g' \
   > "${OUT_DIR}/gateway-access-log.log" || true
 echo "    $(wc -l < "${OUT_DIR}/gateway-access-log.log") access log lines"
 DC_COUNT=$(grep -c " 0 DC " "${OUT_DIR}/gateway-access-log.log" || true)
 echo "    \"0 DC\" (downstream disconnect) count: ${DC_COUNT}"
 
-echo "==> 3/6 gateway envoy /clusters dump for jellyfin upstream (the leak fingerprint)"
+echo "==> 3/6 gateway envoy /clusters dump for jellyfin upstream (counter signature)"
 kubectl exec -n media "$GW" -c istio-proxy -- pilot-agent request GET /clusters 2>/dev/null \
   | grep "outbound|8096||jellyfin" \
   > "${OUT_DIR}/gateway-clusters-jellyfin.txt" || true
@@ -56,8 +57,9 @@ grep -E "rq_active|rq_total|rq_success|rq_error|rq_timeout" "${OUT_DIR}/gateway-
 echo "==> 4/6 gateway envoy istio_requests_total breakdown (response_code × response_flags)"
 kubectl exec -n media "$GW" -c istio-proxy -- pilot-agent request GET stats 2>/dev/null \
   | grep "istio_requests_total.*destination_service.jellyfin" \
-  | sed -E 's/.*response_code\.([0-9-]+)\.grpc_response_status\.response_flags\.([^.]+).*: ([0-9]+)/code=\1 flags=\2 count=\3/' \
-  | sort | uniq -c \
+  | sed -En 's/.*response_code\.([0-9-]+)\.grpc_response_status\.response_flags\.([^.]+).*: ([0-9]+)/code=\1 flags=\2 count=\3/p' \
+  | awk '{ key=$1 " " $2; split($3, v, "="); sum[key]+=v[2] } END { for (key in sum) print key " count=" sum[key] }' \
+  | sort \
   > "${OUT_DIR}/gateway-requests-by-flag.txt" || true
 echo "    breakdown:"
 sed 's/^/      /' "${OUT_DIR}/gateway-requests-by-flag.txt"

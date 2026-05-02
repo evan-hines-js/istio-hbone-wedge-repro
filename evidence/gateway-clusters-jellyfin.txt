@@ -11,12 +11,12 @@ outbound|8096||jellyfin.media.svc.cluster.local::added_via_api::true
 outbound|8096||jellyfin.media.svc.cluster.local::eds_service_name::outbound|8096||jellyfin.media.svc.cluster.local
 outbound|8096||jellyfin.media.svc.cluster.local::envoy://connect_originate/10.244.0.8:8096::cx_active::7
 outbound|8096||jellyfin.media.svc.cluster.local::envoy://connect_originate/10.244.0.8:8096::cx_connect_fail::0
-outbound|8096||jellyfin.media.svc.cluster.local::envoy://connect_originate/10.244.0.8:8096::cx_total::22
+outbound|8096||jellyfin.media.svc.cluster.local::envoy://connect_originate/10.244.0.8:8096::cx_total::28
 outbound|8096||jellyfin.media.svc.cluster.local::envoy://connect_originate/10.244.0.8:8096::rq_active::7
 outbound|8096||jellyfin.media.svc.cluster.local::envoy://connect_originate/10.244.0.8:8096::rq_error::0
-outbound|8096||jellyfin.media.svc.cluster.local::envoy://connect_originate/10.244.0.8:8096::rq_success::152
+outbound|8096||jellyfin.media.svc.cluster.local::envoy://connect_originate/10.244.0.8:8096::rq_success::580
 outbound|8096||jellyfin.media.svc.cluster.local::envoy://connect_originate/10.244.0.8:8096::rq_timeout::0
-outbound|8096||jellyfin.media.svc.cluster.local::envoy://connect_originate/10.244.0.8:8096::rq_total::167
+outbound|8096||jellyfin.media.svc.cluster.local::envoy://connect_originate/10.244.0.8:8096::rq_total::599
 outbound|8096||jellyfin.media.svc.cluster.local::envoy://connect_originate/10.244.0.8:8096::hostname::
 outbound|8096||jellyfin.media.svc.cluster.local::envoy://connect_originate/10.244.0.8:8096::health_flags::healthy
 outbound|8096||jellyfin.media.svc.cluster.local::envoy://connect_originate/10.244.0.8:8096::weight::1

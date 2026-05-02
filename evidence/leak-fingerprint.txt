@@ -1,20 +1,18 @@
 Captured during browser playback of Big Buck Bunny on the kind cluster.
 Polling gateway envoy /clusters every 6s for outbound|8096||jellyfin.
 
-leak = rq_total - rq_success - rq_active
-       (= requests envoy classified as neither success nor still active —
-        i.e. vanished from accounting)
+gap = rq_total - rq_success - rq_active
 
-time     | cx_act cx_tot | rq_act rq_tot rq_succ | leak
+time     | cx_act cx_tot | rq_act rq_tot rq_succ | gap
 ---------+---------------+------------------------+-----
 02:19:50 |    5    13   |    2    216    212    |  2
 02:19:56 |    3    17   |    3    228    221    |  4
 02:20:03 |    6    21   |    6    232    221    |  5
-02:20:09 |    7    22   |    7    233    221    |  5    ← rq_success freezes at 221
+02:20:09 |    7    22   |    7    233    221    |  5    ← rq_success last incremented here
 02:20:15 |    7    22   |    7    233    221    |  5
-02:20:21 |    7    22   |    7    233    221    |  5    (6s, zero progress: 7 streams stuck in flight)
+02:20:21 |    7    22   |    7    233    221    |  5
 02:20:27 |    7    22   |    7    233    221    |  5
-02:20:33 |   12    28   |   12    239    221    |  6    (more requests arrive, all stick)
+02:20:33 |   12    28   |   12    239    221    |  6
 02:20:40 |   13    29   |   13    240    221    |  6
 02:20:46 |   13    29   |   13    240    221    |  6
 02:20:52 |   13    29   |   13    240    221    |  6
@@ -23,18 +21,13 @@ time     | cx_act cx_tot | rq_act rq_tot rq_succ | leak
 02:21:11 |   13    29   |   13    240    221    |  6
 02:21:17 |   13    29   |   13    240    221    |  6
 
-After this trace ended, the gateway pod was deliberately restarted to clear
-the wedge. Without restart, rq_success would have remained frozen indefinitely
-and the leak would have grown until the pool's logical request slots
-(circuit_breaker max_requests = 4294967295) were exhausted — practically forever.
+The trace ended when the gateway pod was restarted to clear the wedge. Up
+to that point, browser playback remained stalled.
 
-Counters that did NOT increment during the leak:
-  - rq_error    (envoy never classified the streams as errored)
-  - rq_timeout  (no per-request timeout configured for the cluster)
-  - rq_retry    (no retries triggered)
+Counters that did not increment over this trace:
+  - rq_error
+  - rq_timeout
+  - rq_retry
 
-Conclusion: requests sent over the HBONE upstream pool's HTTP/2 CONNECT tunnel
-that terminate via codec-emitted RST_STREAM(INTERNAL_ERROR) (see
-ztunnel-rst-stream.log) are not accounted for in any upstream cluster counter.
-They leak silently. From the downstream client's perspective, the request
-hangs until the client gives up.
+For the corresponding ztunnel "stream error received: unexpected internal
+error encountered" lines, see ztunnel.log from a passive-playback run.
